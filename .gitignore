@@ -10,3 +10,8 @@ benchmark_results
 .idea
 build
 .mentat_config.json
+.pytest_cache
+benchmark_repos
+docs/build
+.DS_Store
+benchmarks/benchmarks/swe_bench_samples

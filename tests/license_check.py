@@ -4,15 +4,34 @@ import subprocess
 import fire
 
 library_exceptions = [
-    "mentat-ai",
+    "mentat",
     # pip-licenses shows tiktoken's full license text, but it is MIT
     "tiktoken",
+    # openai as Apache 2.0; for some reason, after updating to 1.0, pip-licenses thinks it's UNKNOWN
+    "openai",
+    # Is Apache 2.0 but shows up as UNKNOWN
+    "chroma-hnswlib",
+    # textual-autocomplete is MIT but shows up as UNKNOWN
+    "textual-autocomplete",
 ]
 accepted_licenses = [
     "BSD License",
     "Apache Software License",
     "MIT License",
+    "MIT",
     "Mozilla Public License 2.0 (MPL 2.0)",
+    "Python Software Foundation License",
+    "Apache 2.0",
+    "Apache-2.0",
+    "BSD 3-Clause",
+    "3-Clause BSD License",
+    "ISC License (ISCL)",
+    "Historical Permission Notice and Disclaimer (HPND)",
+    "BSD",
+    "The Unlicense (Unlicense)",
+    "Apache License, Version 2.0",
+    "Apache License v2.0",
+    "DFSG approved",
 ]
 
 

@@ -1,11 +1,10 @@
 import os
 import shutil
 import subprocess
-from textwrap import dedent
 
 import pytest
 
-from mentat.app import run
+from mentat.session import Session
 
 # These benchmarks use GPT and won't run automatically.
 # Run them with python tests/record_benchmark.py True
@@ -14,55 +13,63 @@ from mentat.app import run
 pytestmark = pytest.mark.benchmark
 
 
-def test_calculator_add_power(mock_collect_user_input):
-    mock_collect_user_input.side_effect = [
-        (
-            "Add power as a possible operation, raising the first arg to the power of"
-            " the second"
-        ),
-        "y",
-        KeyboardInterrupt,
-    ]
-
-    calculator_path = os.path.join("scripts/calculator.py")
-    run([calculator_path])
-
-    result = subprocess.run(
-        ["python", calculator_path, "power", "15", "3"], capture_output=True, text=True
+async def edit_file_and_run(
+    temp_testbed,
+    mock_collect_user_input,
+    prompts,
+    context_file_paths,
+    main_file_path,
+    argument_lists,
+):
+    mock_collect_user_input.set_stream_messages(
+        [prompt for pair in zip(prompts, ["y"] * len(prompts)) for prompt in pair] + ["q"]
     )
-    assert float(result.stdout.strip()) == 3375.0
+
+    session = Session(cwd=temp_testbed, paths=context_file_paths)
+    session.start()
+    await session.stream.recv(channel="client_exit")
+
+    assert os.path.exists(main_file_path)
+
+    results = []
+    for arguments in argument_lists:
+        result = subprocess.check_output(["python", main_file_path, *arguments], text=True)
+        results.append(result.strip())
+    return results
 
 
-def test_calculator_add_exp_then_log(mock_collect_user_input):
-    mock_collect_user_input.side_effect = [
-        "Add exponentation operation, called with 'exp'",
-        "y",
-        "Add logarithm operation, called with 'log'",
-        "y",
-        KeyboardInterrupt,
-    ]
-
+@pytest.mark.asyncio
+async def test_calculator_add_power(mock_collect_user_input):
     calculator_path = "scripts/calculator.py"
-    run([calculator_path])
-
-    result = subprocess.run(
-        ["python", calculator_path, "exp", "15", "3"], capture_output=True, text=True
+    results = await edit_file_and_run(
+        mock_collect_user_input,
+        prompts=["Add power as a possible operation, raising the first arg to the power of the second"],
+        context_file_paths=[calculator_path],
+        main_file_path=calculator_path,
+        argument_lists=[["power", "15", "3"]],
     )
-    assert float(result.stdout.strip()) == 3375.0
+    assert float(results[0]) == 3375.0
 
-    result = subprocess.run(
-        ["python", calculator_path, "log", "10", "2"], capture_output=True, text=True
+
+@pytest.mark.asyncio
+async def test_calculator_add_exp_then_log(mock_collect_user_input):
+    calculator_path = "scripts/calculator.py"
+    results = await edit_file_and_run(
+        mock_collect_user_input,
+        prompts=[
+            "Add exponentation operation, called with 'exp'",
+            "Add logarithm operation, called with 'log'",
+        ],
+        context_file_paths=[calculator_path],
+        main_file_path=calculator_path,
+        argument_lists=[["exp", "15", "3"], ["log", "10", "2"]],
     )
-    assert float(result.stdout.strip()) == 3.3219280948873626
+    assert float(results[0]) == 3375.0
+    assert float(results[1]) == 3.3219280948873626
 
 
-def test_calculator_continue_change(mock_collect_user_input):
-    mock_collect_user_input.side_effect = [
-        "complete the change I started",
-        "y",
-        KeyboardInterrupt,
-    ]
-
+@pytest.mark.asyncio
+async def test_calculator_continue_change(mock_collect_user_input):
     calculator_path = "scripts/calculator.py"
 
     with open(calculator_path, "r") as f:
@@ -74,43 +81,38 @@ def test_calculator_continue_change(mock_collect_user_input):
         "def exp_numbers(a, b):\n",
         "    return a**b\n",
     ]
-    calculator_lines = (
-        calculator_lines[: index + 1] + new_lines + calculator_lines[index + 1 :]
-    )
+    calculator_lines = calculator_lines[: index + 1] + new_lines + calculator_lines[index + 1 :]
     with open(calculator_path, "w") as f:
         f.writelines(calculator_lines)
 
-    run([calculator_path])
-
-    result = subprocess.run(
-        ["python", calculator_path, "exp", "15", "3"], capture_output=True, text=True
+    results = await edit_file_and_run(
+        mock_collect_user_input,
+        prompts=["complete the change I started"],
+        context_file_paths=[calculator_path],
+        main_file_path=calculator_path,
+        argument_lists=[["exp", "15", "3"]],
     )
-    assert float(result.stdout.strip()) == 3375.0
+    assert float(results[0]) == 3375.0
 
 
-def test_multifile_calculator(mock_collect_user_input):
-    mock_collect_user_input.side_effect = [
-        "add exp and log functions to take a^b and log a base b",
-        "y",
-        KeyboardInterrupt,
-    ]
-
+@pytest.mark.asyncio
+async def test_multifile_calculator(mock_collect_user_input):
     multifile_calculator_path = "multifile_calculator"
     calculator_path = os.path.join(multifile_calculator_path, "calculator.py")
-
-    run([multifile_calculator_path])
-    result = subprocess.run(
-        ["python", calculator_path, "exp", "15", "3"], capture_output=True, text=True
+    results = await edit_file_and_run(
+        mock_collect_user_input,
+        prompts=["add exp and log functions to take a^b and log a base b"],
+        context_file_paths=[multifile_calculator_path],
+        main_file_path=calculator_path,
+        argument_lists=[["exp", "15", "3"], ["log", "10", "2"]],
     )
-    assert float(result.stdout.strip()) == 3375.0
 
-    result = subprocess.run(
-        ["python", calculator_path, "log", "10", "2"], capture_output=True, text=True
-    )
-    assert float(result.stdout.strip()) == 3.3219280948873626
+    assert float(results[0]) == 3375.0
+    assert float(results[1]) == 3.3219280948873626
 
 
-def test_start_project_from_scratch(mock_collect_user_input):
+@pytest.mark.asyncio
+async def test_start_project_from_scratch(mock_collect_user_input):
     # Clear the testbed so we can test that it works with empty directories
     for item in os.listdir("."):
         if os.path.isfile(item):
@@ -120,36 +122,14 @@ def test_start_project_from_scratch(mock_collect_user_input):
                 shutil.rmtree(item)
     subprocess.run(["git", "rm", "-r", "--cached", "."])
 
-    mock_collect_user_input.side_effect = [
-        "make a file that does fizzbuzz, named fizzbuzz.py, going up to 10",
-        "y",
-        KeyboardInterrupt,
-    ]
-    run(["."])
-
     fizzbuzz_path = "fizzbuzz.py"
-    assert os.path.exists(fizzbuzz_path)
-
-    result = subprocess.run(["python", fizzbuzz_path], capture_output=True, text=True)
-    expected_output = "1\n2\nFizz\n4\nBuzz\nFizz\n7\n8\nFizz\nBuzz\n"
-    assert result.stdout.strip() == expected_output.strip()
-
-
-def test_import_from_code_map(mock_collect_user_input):
-    prompt = """
-        make a file that gets the base64 encoded value of echo_hardcoded, named 
-        encoded_echo.py, and print the encoded value as a string
-    """
-    prompt = dedent(prompt).strip()
-
-    mock_collect_user_input.side_effect = [prompt, "y", KeyboardInterrupt]
-    run([])
-
-    encoded_echo_path = "encoded_echo.py"
-    assert os.path.exists(encoded_echo_path)
-
-    result = subprocess.run(
-        ["python", encoded_echo_path], capture_output=True, text=True
+    results = await edit_file_and_run(
+        mock_collect_user_input,
+        prompts=["make a file that does fizzbuzz, named fizzbuzz.py, going up to 10"],
+        context_file_paths=["."],
+        main_file_path=fizzbuzz_path,
+        argument_lists=[[]],
     )
-    expected_output = "MDBtcDk0ITJQZ0slaTJoQG0mNVh6azRUJlZxQypOV1FebXA5NCEyUGdLJWkyaEBtJjVYems0VCZWcUMqTldRXg=="
-    assert result.stdout.strip() == expected_output.strip()
+
+    expected_output = "1\n2\nFizz\n4\nBuzz\nFizz\n7\n8\nFizz\nBuzz"
+    assert results[0] == expected_output

@@ -3,39 +3,46 @@
 
 name: lint and test
 
-on:
-  push:
-    branches:
-      - main
-  pull_request:
-    branches:
-      - main
+on: [push, pull_request]
+
 
 jobs:
-  ruff-black-isort:
+  ruff:
     runs-on: ubuntu-latest
+    timeout-minutes: 5
     steps:
       - uses: actions/checkout@v3
-      - uses: chartboost/ruff-action@v1
-      - name: Install dependencies
+      - name: install reqs
         run: |
-          python -m pip install .
-      - name: black check
-        run: black --check --preview .
-      - name: isort check
-        run: isort --profile black --check .
+          curl -LsSf https://astral.sh/uv/install.sh | sh
+          uv venv
+          uv pip install -r dev-requirements.txt
+      - name: activate venv
+        run: |
+          . .venv/bin/activate
+          echo PATH=$PATH >> $GITHUB_ENV
+      - name: ruff (linter)
+        run: ruff check --select I .
+      - name: ruff (formatter)
+        run: ruff format --check .
 
   build:
     runs-on: ${{ matrix.os }}
+    # Set timeout to 20 minutes for Windows due to longer build times, otherwise 10 minutes
+    timeout-minutes: ${{ matrix.os == 'windows-latest' && 20 || 10 }}
 
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, windows-latest, macos-latest]
+        os: [ubuntu-latest, windows-latest, macos-14]
         python-version: ["3.10", "3.11"]
 
     steps:
       - uses: actions/checkout@v3
+      - name: Setup node (for pyright)
+        uses: actions/setup-node@v4
+        with:
+          node-version: "16"
       - name: Set up Python ${{ matrix.python-version }}
         uses: actions/setup-python@v3
         with:
@@ -43,12 +50,24 @@ jobs:
       - name: Install dependencies
         run: |
           python -m pip install .
+          python -m pip install -r dev-requirements.txt
+      - name: Check types with pyright
+        run: |
+          pyright
       - name: Test with pytest
         run: |
           pytest
-          
+      - name: Can run Mentat
+        # Unfortunately Github Actions Runners have trouble with prompt toolkit, so we can't do this on Windows.
+        if: runner.os != 'Windows'
+        # Ensure that python doesn't import local mentat folder and that 'mentat' command calls mentat instead of switching folders.
+        working-directory: ./testbed
+        run: |
+          mentat
+
   license-check:
     runs-on: ubuntu-latest
+    timeout-minutes: 5
 
     steps:
       - uses: actions/checkout@v3
@@ -59,9 +78,7 @@ jobs:
       - name: Install dependencies
         run: |
           python -m pip install .
-      - name: Install pip-licenses
-        run: |
-          pip install pip-licenses
+          pip install -r dev-requirements.txt
       - name: Run license checking script
         run: |
           python tests/license_check.py

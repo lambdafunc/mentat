@@ -1,161 +1,153 @@
+from __future__ import annotations
+
 import logging
-import math
 import os
-from collections import defaultdict
 from pathlib import Path
-from typing import Iterable, Union
+from typing import TYPE_CHECKING, List
 
-from termcolor import cprint
+from mentat.edit_history import EditHistory
+from mentat.errors import MentatError
+from mentat.interval import Interval
+from mentat.session_context import SESSION_CONTEXT
+from mentat.session_input import ask_yes_no
+from mentat.utils import get_relative_path, sha256
 
-from .change_conflict_resolution import (
-    resolve_insertion_conflicts,
-    resolve_non_insertion_conflicts,
-)
-from .code_change import CodeChange, CodeChangeAction
-from .code_context import CodeContext
-from .code_file import CodeFile
-from .config_manager import ConfigManager
-from .errors import MentatError
-from .git_handler import get_git_diff_for_path
-from .user_input_manager import UserInputManager
+if TYPE_CHECKING:
+    # This normally will cause a circular import
+    from mentat.parsers.file_edit import FileEdit
 
 
 class CodeFileManager:
-    def __init__(
-        self,
-        user_input_manager: UserInputManager,
-        config: ConfigManager,
-        code_context: CodeContext,
-    ):
-        self.user_input_manager = user_input_manager
-        self.config = config
-        self.code_context = code_context
+    def __init__(self):
+        self.file_lines = dict[Path, list[str]]()
+        self.history = EditHistory()
 
-    def _read_file(self, file: Union[str, CodeFile]) -> Iterable[str]:
-        if isinstance(file, CodeFile):
-            rel_path = file.path
-        else:
-            rel_path = self.config.git_root / file
-        abs_path = self.config.git_root / rel_path
+    def read_file(self, path: Path) -> list[str]:
+        # TODO: Change to only ever using this function to read files, then cache files and
+        # only re-read them when their last modified time is updated
+        session_context = SESSION_CONTEXT.get()
 
+        abs_path = path if path.is_absolute() else session_context.cwd / path
         with open(abs_path, "r") as f:
             lines = f.read().split("\n")
+        self.file_lines[abs_path] = lines
         return lines
 
-    def _read_all_file_lines(self) -> None:
-        self.file_lines = dict()
-        for file in self.code_context.files.values():
-            rel_path = os.path.relpath(file.path, self.config.git_root)
-            # here keys are str not path object
-            self.file_lines[rel_path] = self._read_file(file)
+    def create_file(self, abs_path: Path, content: str = ""):
+        ctx = SESSION_CONTEXT.get()
+        code_context = ctx.code_context
 
-    def get_code_message(self):
-        self._read_all_file_lines()
-        code_message = ["Code Files:\n"]
-        for file in self.code_context.files.values():
-            abs_path = file.path
-            rel_path = os.path.relpath(abs_path, self.config.git_root)
+        logging.info(f"Creating new file {abs_path}")
+        # Create any missing directories in the path
+        abs_path.parent.mkdir(parents=True, exist_ok=True)
+        with open(abs_path, "w") as f:
+            f.write(content)
 
-            # We always want to give GPT posix paths
-            posix_rel_path = Path(rel_path).as_posix()
-            code_message.append(posix_rel_path)
+        if abs_path not in code_context.include_files:
+            code_context.include(abs_path)
 
-            for i, line in enumerate(self.file_lines[rel_path], start=1):
-                if file.contains_line(i):
-                    code_message.append(f"{i}:{line}")
-            code_message.append("")
+    def delete_file(self, abs_path: Path):
+        ctx = SESSION_CONTEXT.get()
+        code_context = ctx.code_context
 
-            git_diff_output = get_git_diff_for_path(self.config.git_root, rel_path)
-            if git_diff_output:
-                code_message.append("Current git diff for this file:")
-                code_message.append(f"{git_diff_output}")
+        logging.info(f"Deleting file {abs_path}")
 
-        return "\n".join(code_message)
+        if abs_path in code_context.include_files:
+            code_context.exclude(abs_path)
+        abs_path.unlink()
 
-    def _handle_delete(self, delete_change):
-        file_path = self.config.git_root / delete_change.file
-        if not file_path.exists():
-            logging.error(f"Path {file_path} non-existent on delete")
-            return
+    def rename_file(self, abs_path: Path, new_abs_path: Path):
+        ctx = SESSION_CONTEXT.get()
+        code_context = ctx.code_context
 
-        cprint(f"Are you sure you want to delete {delete_change.file}?", "red")
-        if self.user_input_manager.ask_yes_no(default_yes=False):
-            logging.info(f"Deleting file {file_path}")
-            cprint(f"Deleting {delete_change.file}...")
-            if file_path in self.code_context.files:
-                del self.code_context.files[file_path]
-            file_path.unlink()
-        else:
-            cprint(f"Not deleting {delete_change.file}")
+        logging.info(f"Renaming file {abs_path} to {new_abs_path}")
+        if abs_path in code_context.include_files:
+            code_context.exclude(abs_path)
+        os.rename(abs_path, new_abs_path)
+        if new_abs_path not in code_context.include_files:
+            code_context.include(new_abs_path)
 
-    def _get_new_code_lines(self, changes) -> Iterable[str] | None:
-        if len(set(map(lambda change: change.file, changes))) > 1:
-            raise Exception("All changes passed in must be for the same file")
+    def write_to_file(self, abs_path: Path, new_lines: List[str]):
+        with open(abs_path, "w") as f:
+            f.write("\n".join(new_lines))
+        self.file_lines[abs_path] = new_lines
 
-        changes = sorted(changes, reverse=True)
+    # Mainly does checks on if file is in context, file exists, file is unchanged, etc.
+    async def write_changes_to_files(
+        self,
+        file_edits: list[FileEdit],
+    ) -> list[FileEdit]:
+        session_context = SESSION_CONTEXT.get()
+        stream = session_context.stream
+        agent_handler = session_context.agent_handler
 
-        # We resolve insertion conflicts twice because non-insertion conflicts
-        # might move insert blocks outside of replace/delete blocks and cause
-        # them to conflict again
-        changes = resolve_insertion_conflicts(changes, self.user_input_manager, self)
-        changes = resolve_non_insertion_conflicts(changes, self.user_input_manager)
-        changes = resolve_insertion_conflicts(changes, self.user_input_manager, self)
-        if not changes:
+        if not file_edits:
             return []
 
-        rel_path = str(changes[0].file)
-        new_code_lines = self.file_lines[rel_path].copy()
-        if new_code_lines != self._read_file(rel_path):
-            logging.info(f"File '{rel_path}' changed while generating changes")
-            cprint(
-                f"File '{rel_path}' changed while generating; current file changes"
-                " will be erased. Continue?",
-                color="light_yellow",
-            )
-            if not self.user_input_manager.ask_yes_no(default_yes=False):
-                cprint(f"Not applying changes to file {rel_path}.")
-                return None
+        applied_edits: list[FileEdit] = []
+        for file_edit in file_edits:
+            display_path = get_relative_path(file_edit.file_path, session_context.cwd)
 
-        # Necessary in case the model needs to insert past the end of the file
-        last_line = len(new_code_lines) + 1
-        largest_changed_line = math.ceil(changes[0].last_changed_line)
-        if largest_changed_line > last_line:
-            new_code_lines += [""] * (largest_changed_line - last_line)
+            if file_edit.is_creation:
+                if file_edit.file_path.exists():
+                    raise MentatError(f"Model attempted to create file {file_edit.file_path} which already exists")
+                self.create_file(file_edit.file_path)
+            elif not file_edit.file_path.exists():
+                raise MentatError(f"Attempted to edit non-existent file {file_edit.file_path}")
 
-        min_changed_line = largest_changed_line + 1
-        for i, change in enumerate(changes):
-            if change.last_changed_line >= min_changed_line:
-                raise MentatError(f"Change line number overlap in file {change.file}")
-            min_changed_line = change.first_changed_line
-            new_code_lines = change.apply(new_code_lines)
-        return new_code_lines
+            if file_edit.is_deletion:
+                stream.send(f"Deleting {display_path}...", style="error")
+                # We use the current lines rather than the stored lines for undo
+                file_edit.previous_file_lines = self.read_file(file_edit.file_path)
+                self.delete_file(file_edit.file_path)
+                applied_edits.append(file_edit)
+                continue
 
-    def write_changes_to_files(self, code_changes: list[CodeChange]) -> None:
-        files_to_write = dict()
-        file_changes = defaultdict(list)
-        for code_change in code_changes:
-            # here keys are str not path object
-            rel_path = str(code_change.file)
-            if code_change.action == CodeChangeAction.CreateFile:
-                cprint(f"Creating new file {rel_path}", color="light_green")
-                files_to_write[rel_path] = code_change.code_lines
-            elif code_change.action == CodeChangeAction.DeleteFile:
-                self._handle_delete(code_change)
+            if not file_edit.is_creation:
+                # TODO: We use read_file so much that this probably doesn't work anymore
+                # We should instead make sure the last modified time doesn't change between code message and now
+                stored_lines = self.file_lines[file_edit.file_path]
+                if stored_lines != self.read_file(file_edit.file_path):
+                    logging.info(f"File '{file_edit.file_path}' changed while generating changes")
+                    stream.send(
+                        f"File '{display_path}' changed while"
+                        " generating; current file changes will be erased. Continue?",
+                        style="warning",
+                    )
+                    if not await ask_yes_no(default_yes=False):
+                        stream.send(f"Not applying changes to file {display_path}")
+                        continue
             else:
-                file_changes[rel_path].append(code_change)
+                stored_lines = []
 
-        for file_path, changes in file_changes.items():
-            new_code_lines = self._get_new_code_lines(changes)
-            if new_code_lines:
-                files_to_write[file_path] = new_code_lines
+            if file_edit.rename_file_path is not None:
+                if file_edit.rename_file_path.exists():
+                    raise MentatError(
+                        f"Attempted to rename file {file_edit.file_path} to existing"
+                        f" file {file_edit.rename_file_path}"
+                    )
+                self.rename_file(file_edit.file_path, file_edit.rename_file_path)
 
-        for rel_path, code_lines in files_to_write.items():
-            file_path = self.config.git_root / rel_path
-            if file_path not in self.code_context.files:
-                # newly created files added to Mentat's context
-                logging.info(f"Adding new file {file_path} to context")
-                self.code_context.files[file_path] = CodeFile(file_path)
-                # create any missing directories in the path
-                file_path.parent.mkdir(parents=True, exist_ok=True)
-            with open(file_path, "w") as f:
-                f.write("\n".join(code_lines))
+            new_lines = file_edit.get_updated_file_lines(stored_lines)
+            if new_lines != stored_lines:
+                file_path = file_edit.rename_file_path or file_edit.file_path
+                # We use the current lines rather than the stored lines for undo
+                file_edit.previous_file_lines = self.read_file(file_path)
+                self.write_to_file(file_path, new_lines)
+            applied_edits.append(file_edit)
+
+        for applied_edit in applied_edits:
+            self.history.add_edit(applied_edit)
+        if not agent_handler.agent_enabled:
+            self.history.push_edits()
+        return applied_edits
+
+    def get_file_checksum(self, path: Path, interval: Interval | None = None) -> str:
+        if path.is_dir():
+            return ""  # TODO: Build and maintain a hash tree for git_root
+        text = path.read_text()
+        if interval is not None:
+            lines = text.splitlines()
+            filtered_lines = [line for i, line in enumerate(lines, start=1) if interval.contains(i)]
+            text = "\n".join(filtered_lines)
+        return sha256(text)
